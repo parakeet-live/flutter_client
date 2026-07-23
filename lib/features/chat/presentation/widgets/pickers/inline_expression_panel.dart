@@ -11,6 +11,8 @@ import 'package:fluxer_app/features/chat/providers/core/chat_view_model.dart';
 import 'package:fluxer_app/features/chat/providers/pickers/emoji_picker_provider.dart';
 import 'package:fluxer_app/features/chat/providers/pickers/expression_panel_provider.dart';
 import 'package:fluxer_app/features/chat/providers/pickers/sticker_picker_provider.dart';
+import 'package:fluxer_app/features/chat/utils/emoji_picker_precache.dart';
+import 'package:fluxer_app/features/shell/presentation/responsive_layout.dart';
 import 'package:fluxer_app/l10n/generated/fluxer_localizations.dart';
 import 'package:fluxer_app/shared/gestures/expandable_sheet_gestures.dart';
 
@@ -55,6 +57,7 @@ class _ExpressionPanelContentState extends ConsumerState<ExpressionPanelContent>
   final TextEditingController _searchController = TextEditingController();
   String _searchQuery = '';
   Timer? _searchDebounce;
+  var _cancelEmojiWarmup = false;
   late final AnimationController _fadeController;
   late final Animation<double> _contentFade;
 
@@ -89,10 +92,21 @@ class _ExpressionPanelContentState extends ConsumerState<ExpressionPanelContent>
     } else {
       _fadeController.value = 1;
     }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !isMobileLayout(context)) {
+        return;
+      }
+      scheduleEmojiPickerWarmup(
+        ref: ref,
+        context: context,
+        isCancelled: () => _cancelEmojiWarmup,
+      );
+    });
   }
 
   @override
   void dispose() {
+    _cancelEmojiWarmup = true;
     _searchDebounce?.cancel();
     _searchController.dispose();
     _fadeController.dispose();
@@ -146,7 +160,7 @@ class _ExpressionPanelContentState extends ConsumerState<ExpressionPanelContent>
                   if (widget.scrollController.hasClients) {
                     widget.scrollController.jumpTo(0);
                   }
-                  ref.read(expressionPanelTabProvider.notifier).select(tab);
+                  ref.read(expressionPanelTabProvider.notifier).tab = tab;
                 }
               },
               initialTab: selectedTab,
@@ -223,7 +237,7 @@ class _ExpressionPanelContentState extends ConsumerState<ExpressionPanelContent>
                       if (widget.scrollController.hasClients) {
                         widget.scrollController.jumpTo(0);
                       }
-                      ref.read(expressionPanelTabProvider.notifier).select(tab);
+                      ref.read(expressionPanelTabProvider.notifier).tab = tab;
                     }
                   },
                   child: AnimatedContainer(

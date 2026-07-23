@@ -24,6 +24,7 @@ import 'package:fluxer_app/features/channels/providers/read_state_repository_pro
 import 'package:fluxer_app/features/chat/data/message_repository.dart';
 import 'package:fluxer_app/features/chat/domain/favorite_meme.dart';
 import 'package:fluxer_app/features/chat/domain/message.dart';
+import 'package:fluxer_app/features/chat/domain/message_attachment_update.dart';
 import 'package:fluxer_app/features/chat/domain/message_upload_send_cancelled_exception.dart';
 import 'package:fluxer_app/features/chat/domain/message_window.dart';
 import 'package:fluxer_app/features/chat/domain/pending_attachment.dart';
@@ -73,6 +74,7 @@ part 'chat_view_model.g.dart';
 
 const _kPageSize = 30;
 const _kInitialPageSize = 50;
+const _kJumpToPresentPageSize = 50;
 const Duration _kChannelNetworkRefreshTtl = Duration(seconds: 30);
 const _kReadAckMinInterval = Duration(seconds: 1);
 const _kDraftSaveDebounce = Duration(milliseconds: 400);
@@ -860,6 +862,7 @@ class ChatViewModel extends _$ChatViewModel {
   }
 
   void highlightJumpMessage(String messageId) {
+    talker.debug('[ChatViewModel] highlightJumpMessage $messageId');
     _jumpHighlightTimer?.cancel();
     _jumpHighlightTimer = null;
     final int sequence = state.jumpHighlightSequence + 1;
@@ -898,6 +901,10 @@ class ChatViewModel extends _$ChatViewModel {
     String? targetMessageId,
     bool loadMessages = true,
   }) async {
+    talker.debug(
+      '[ChatViewModel] switchChannel channel=$channelId '
+      'target=$targetMessageId load=$loadMessages',
+    );
     final Stopwatch switchStopwatch = Stopwatch()..start();
     if (state.channelId == channelId &&
         targetMessageId != null &&
@@ -988,6 +995,9 @@ class ChatViewModel extends _$ChatViewModel {
         if (state.channelId == channelId &&
             state.isLoading &&
             !isChannelChange) {
+          talker.debug(
+            '[ChatViewModel] target load already in progress channel=$channelId',
+          );
           return;
         }
         if (state.channelId == channelId &&
@@ -995,6 +1005,10 @@ class ChatViewModel extends _$ChatViewModel {
             !state.isLoading &&
             !state.isSyncingMessages &&
             state.messages.any((Message m) => m.id == targetMessageId)) {
+          talker.debug(
+            '[ChatViewModel] target already in memory channel=$channelId '
+            'target=$targetMessageId',
+          );
           highlightJumpMessage(targetMessageId);
           scrollToMessage(targetMessageId);
           return;
@@ -1019,7 +1033,16 @@ class ChatViewModel extends _$ChatViewModel {
           shouldApplyResult: isCurrentSwitch,
         );
         if (isCurrentSwitch() && state.channelId == channelId) {
+          talker.debug(
+            '[ChatViewModel] target loaded; scrollToMessage '
+            'channel=$channelId target=$targetMessageId',
+          );
           scrollToMessage(targetMessageId);
+        } else {
+          talker.debug(
+            '[ChatViewModel] target load superseded; skip scroll '
+            'channel=$channelId target=$targetMessageId',
+          );
         }
         return;
       }
@@ -1046,6 +1069,9 @@ class ChatViewModel extends _$ChatViewModel {
             isDirectLatestLoad: false,
             preserveLoadedWindow: true,
           ).whenComplete(() {
+            if (!ref.mounted) {
+              return;
+            }
             if (isCurrentSwitch() && state.channelId == channelId) {
               _markMessagesReconciled(channelId);
             }
@@ -1070,8 +1096,8 @@ class ChatViewModel extends _$ChatViewModel {
           draft: draft,
           replyMentioning: replyMentioning,
           scrollToBottomSignal: state.scrollToBottomSignal,
-          isLoading: false,
-          isSyncingMessages: willRefresh,
+          isLoading: willRefresh,
+          isSyncingMessages: false,
           isLoadingMore: false,
           isLoadingNewer: false,
           hasMoreMessages: cached.length >= _kPageSize,
@@ -1089,6 +1115,9 @@ class ChatViewModel extends _$ChatViewModel {
               isDirectLatestLoad: true,
               shouldApplyResult: isCurrentSwitch,
             ).whenComplete(() {
+              if (!ref.mounted) {
+                return;
+              }
               if (isCurrentSwitch() && state.channelId == channelId) {
                 _markMessagesReconciled(channelId);
               }
@@ -1309,10 +1338,18 @@ class ChatViewModel extends _$ChatViewModel {
       // channel pointer so detached windows remain detached.
       final bool shouldConsultPointer =
           !isDirectLatestLoad || page.messages.length >= limit;
+      final bool isSealedLatestTail =
+          isDirectLatestLoad && page.messages.length < effectiveLimit;
       final bool hasMoreNewer =
           shouldConsultPointer &&
           mergedServerTailId != null &&
-          await _hasNewerMessagesThanChannel(mergedServerTailId);
+          await _hasNewerMessagesThanChannel(
+            mergedServerTailId,
+            sealedTail: isSealedLatestTail,
+            knownLoadedMessageIds: merged
+                .map((Message message) => message.id)
+                .toSet(),
+          );
       if (state.channelId != channelId || !shouldApply()) {
         return;
       }
@@ -1352,6 +1389,9 @@ class ChatViewModel extends _$ChatViewModel {
         _markChannelNetworkRefresh(channelId);
         _markMessagesReconciled(channelId);
         await _onMessagesLoaded(channelId);
+        if (isDirectLatestLoad && page.messages.length < effectiveLimit) {
+          await _reconcileReadStateAfterLatestLoad(channelId);
+        }
       }
     } on Exception catch (e) {
       debugPrint('[ChatViewModel] Failed to load messages: $e');
@@ -1466,6 +1506,39 @@ class ChatViewModel extends _$ChatViewModel {
       }
       return;
     }
+  }
+
+  Future<void> _reconcileReadStateAfterLatestLoad(String channelId) async {
+    if (state.channelId != channelId || !ref.mounted) {
+      return;
+    }
+    final repository = ref.read(readStateRepositoryProvider);
+    await repository.recomputeMentionsAfterBackfill(
+      channelId: channelId,
+      currentUserId: ref.read(currentUserIdProvider),
+      allowDecrease: true,
+    );
+    if (state.channelId != channelId || !ref.mounted) {
+      return;
+    }
+    final database = ref.read(fluxerDatabaseProvider);
+    final readState = await database.readStateDao.getReadState(channelId);
+    if ((readState?.mentionCount ?? 0) > 0 || (readState?.manual ?? false)) {
+      return;
+    }
+    final ackMessageId = readState?.lastMessageId;
+    if (ackMessageId == null || ackMessageId.isEmpty) {
+      return;
+    }
+    final messagesAfterAck = await database.messageDao.getMessagesAfter(
+      channelId,
+      ackMessageId,
+      limit: 1,
+    );
+    if (messagesAfterAck.isNotEmpty) {
+      return;
+    }
+    await repository.applyLocalAckLatest(channelId);
   }
 
   Future<void> loadMore() async {
@@ -1754,14 +1827,20 @@ class ChatViewModel extends _$ChatViewModel {
       scrollToBottom();
       return true;
     }
-    if (state.isSyncingMessages || state.isLoading) {
+    if (state.isSyncingMessages ||
+        state.isLoading ||
+        state.isLoadingMore ||
+        state.isLoadingNewer) {
       return false;
     }
     state = state.copyWith(isSyncingMessages: true);
     try {
       final page = await ref
           .read(messageRepositoryProvider)
-          .loadMessagePage(channelId: channelId);
+          .loadMessagePage(
+            channelId: channelId,
+            limit: _kJumpToPresentPageSize,
+          );
       if (state.channelId != channelId) {
         return false;
       }
@@ -1784,7 +1863,7 @@ class ChatViewModel extends _$ChatViewModel {
       }
       state = state.copyWith(
         messages: merged,
-        hasMoreMessages: page.messages.length >= _kPageSize,
+        hasMoreMessages: page.messages.length >= _kJumpToPresentPageSize,
         hasMoreNewerMessages: false,
       );
       _notifyMessageReferencesLoaded(
@@ -1804,7 +1883,11 @@ class ChatViewModel extends _$ChatViewModel {
     }
   }
 
-  Future<bool> _hasNewerMessagesThanChannel(String messageId) async {
+  Future<bool> _hasNewerMessagesThanChannel(
+    String messageId, {
+    bool sealedTail = false,
+    Set<String>? knownLoadedMessageIds,
+  }) async {
     final db.Channel? channel = await ref
         .read(fluxerDatabaseProvider)
         .channelDao
@@ -1813,7 +1896,29 @@ class ChatViewModel extends _$ChatViewModel {
     if (lastMessageId == null || lastMessageId.isEmpty) {
       return false;
     }
-    return compareSnowflakeIds(lastMessageId, messageId) > 0;
+    if (compareSnowflakeIds(lastMessageId, messageId) <= 0) {
+      return false;
+    }
+    if (knownLoadedMessageIds?.contains(lastMessageId) ?? false) {
+      return true;
+    }
+    final database = ref.read(fluxerDatabaseProvider);
+    final pointerExists =
+        await database.messageDao.getMessage(lastMessageId) != null;
+    if (pointerExists) {
+      return true;
+    }
+    if (sealedTail) {
+      return false;
+    }
+    final readState = await database.readStateDao.getReadState(state.channelId);
+    final String? ackMessageId = readState?.lastMessageId;
+    if (ackMessageId != null &&
+        ackMessageId.isNotEmpty &&
+        compareSnowflakeIds(ackMessageId, messageId) >= 0) {
+      return false;
+    }
+    return true;
   }
 
   /// Live-tail ack target: max(visibleTail, channel.lastMessageId) for web parity.
@@ -1821,17 +1926,26 @@ class ChatViewModel extends _$ChatViewModel {
     required String channelId,
     required String visibleTailId,
   }) async {
-    final db.Channel? channel = await ref
-        .read(fluxerDatabaseProvider)
-        .channelDao
-        .getChannelById(channelId);
-    final String? pointer = channel?.lastMessageId;
+    final database = ref.read(fluxerDatabaseProvider);
+    final db.Channel? channel = await database.channelDao.getChannelById(
+      channelId,
+    );
+    final db.DmChannel? dm = channel == null
+        ? await database.dmChannelDao.getDmChannelById(channelId)
+        : null;
+    final String? pointer = channel?.lastMessageId ?? dm?.lastMessageId;
     if (pointer == null || pointer.isEmpty) {
       return visibleTailId;
     }
-    return compareSnowflakeIds(pointer, visibleTailId) > 0
-        ? pointer
-        : visibleTailId;
+    if (compareSnowflakeIds(pointer, visibleTailId) <= 0) {
+      return visibleTailId;
+    }
+    if (channelId == state.channelId &&
+        state.messages.any((Message message) => message.id == pointer)) {
+      return pointer;
+    }
+    final pointerExists = await database.messageDao.getMessage(pointer) != null;
+    return pointerExists ? pointer : visibleTailId;
   }
 
   Future<void> ackCurrentChannel({bool force = false}) async {
@@ -1844,6 +1958,17 @@ class ChatViewModel extends _$ChatViewModel {
     }
     final String? visibleTailId = newestServerBackedMessageId(state.messages);
     if (!force && visibleTailId == null) {
+      if (!state.hasMoreNewerMessages) {
+        final database = ref.read(fluxerDatabaseProvider);
+        final readState = await database.readStateDao.getReadState(channelId);
+        if (readState != null &&
+            !readState.manual &&
+            (readState.lastMessageId?.isNotEmpty ?? false)) {
+          await ref
+              .read(readStateRepositoryProvider)
+              .applyLocalAckLatest(channelId);
+        }
+      }
       return;
     }
     final now = DateTime.now();
@@ -2921,6 +3046,117 @@ class ChatViewModel extends _$ChatViewModel {
     return deleteFuture;
   }
 
+  Future<void> deleteMessageAttachment({
+    required String messageId,
+    required String attachmentId,
+  }) async {
+    if (state.channelId.isEmpty) {
+      return;
+    }
+    final int messageIndex = state.messages.indexWhere(
+      (Message message) => message.id == messageId,
+    );
+    if (messageIndex == -1) {
+      return;
+    }
+    final Message message = state.messages[messageIndex];
+    Attachment? attachment;
+    for (final Attachment candidate in message.attachments) {
+      if (candidate.id == attachmentId) {
+        attachment = candidate;
+        break;
+      }
+    }
+    if (attachment == null) {
+      return;
+    }
+    final Message updatedMessage = message.copyWith(
+      attachments: message.attachments
+          .where((Attachment a) => a.id != attachmentId)
+          .toList(),
+    );
+    final List<Message> optimisticMessages = List<Message>.from(state.messages);
+    optimisticMessages[messageIndex] = updatedMessage;
+    state = state.copyWith(messages: optimisticMessages);
+    try {
+      await ref
+          .read(messageRepositoryProvider)
+          .deleteAttachment(
+            channelId: state.channelId,
+            messageId: messageId,
+            attachmentId: attachmentId,
+          );
+    } on Exception catch (e) {
+      debugPrint('[ChatViewModel] Failed to delete attachment: $e');
+      final List<Message> rollback = List<Message>.from(state.messages);
+      rollback[messageIndex] = message;
+      state = state.copyWith(
+        messages: rollback,
+        errorMessage: 'Failed to delete attachment',
+      );
+    }
+  }
+
+  Future<void> editAttachmentAltText({
+    required String messageId,
+    required String attachmentId,
+    required String? description,
+  }) async {
+    if (state.channelId.isEmpty) {
+      return;
+    }
+    final int messageIndex = state.messages.indexWhere(
+      (Message message) => message.id == messageId,
+    );
+    if (messageIndex == -1) {
+      return;
+    }
+    final Message message = state.messages[messageIndex];
+    final List<MessageAttachmentUpdate> updates = message.attachments.map((
+      Attachment attachment,
+    ) {
+      if (attachment.id == attachmentId) {
+        return MessageAttachmentUpdate.withDescription(
+          id: attachment.id,
+          description: description,
+        );
+      }
+      return MessageAttachmentUpdate(id: attachment.id);
+    }).toList();
+    final List<Attachment> updatedAttachments = message.attachments.map((
+      Attachment attachment,
+    ) {
+      if (attachment.id == attachmentId) {
+        return attachment.copyWithDescription(description);
+      }
+      return attachment;
+    }).toList();
+    final Message updatedMessage = message.copyWith(
+      attachments: updatedAttachments,
+    );
+    final List<Message> optimisticMessages = List<Message>.from(state.messages);
+    optimisticMessages[messageIndex] = updatedMessage;
+    state = state.copyWith(messages: optimisticMessages);
+    try {
+      await ref
+          .read(messageRepositoryProvider)
+          .editMessageAttachments(
+            channelId: state.channelId,
+            messageId: messageId,
+            content: message.content,
+            attachmentUpdates: updates,
+          );
+    } on Exception catch (e) {
+      debugPrint('[ChatViewModel] Failed to edit attachment alt text: $e');
+      final List<Message> rollback = List<Message>.from(state.messages);
+      rollback[messageIndex] = message;
+      state = state.copyWith(
+        messages: rollback,
+        errorMessage: 'Failed to edit attachment alt text',
+      );
+    }
+  }
+
   void startReply(Message message) {
     unawaited(_startReply(message));
   }
@@ -2995,6 +3231,7 @@ class ChatViewModel extends _$ChatViewModel {
   }
 
   void scrollToMessage(String messageId) {
+    talker.debug('[ChatViewModel] scrollToMessage $messageId');
     _revealCollapsedGroupForMessageIfNeeded(messageId);
     final version = (state.scrollToMessageSignal?.$2 ?? 0) + 1;
     state = state.copyWith(scrollToMessageSignal: (messageId, version));
